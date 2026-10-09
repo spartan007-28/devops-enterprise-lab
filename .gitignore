@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+reports/
+.vite/
+.cache/
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/
+terraform.tfstate*
+.terraform/
+*.tfvars
+!.example.tfvars
