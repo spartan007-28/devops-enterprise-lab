@@ -1,0 +1,79 @@
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-taskflow_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-taskflow_dev}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taskflow_dev_password}
+    volumes:
+      - taskflow-postgres-data:/var/lib/postgresql/data
+    networks:
+      - taskflow-data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  backend:
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    environment:
+      PORT: 3000
+      DATABASE_URL: ${DATABASE_URL:-postgresql://taskflow_dev:taskflow_dev_password@postgres:5432/taskflow_dev?schema=public}
+    command: ["node", "apps/backend/dist/main.js"]
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - taskflow-app
+      - taskflow-data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+      target: migrations
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://taskflow_dev:taskflow_dev_password@postgres:5432/taskflow_dev?schema=public}
+    command: ["node", "node_modules/prisma/build/index.js", "migrate", "deploy", "--schema=apps/backend/prisma/schema.prisma"]
+    networks:
+      - taskflow-data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:3000}
+    ports:
+      - "127.0.0.1:5173:5173"
+    networks:
+      - taskflow-app
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  taskflow-postgres-data:
+    name: taskflow-postgres-data
+
+networks:
+  taskflow-app:
+    name: taskflow-app
+  taskflow-data:
+    name: taskflow-data
+    internal: true
