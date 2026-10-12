@@ -1,0 +1,219 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24.20.0'
+  TRIVY_VERSION: '0.67.2'
+  TRIVY_IMAGE: 'aquasec/trivy:0.67.2'
+
+jobs:
+  quality:
+    name: Quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  audit-dependencies:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: npm audit full and production
+        run: |
+          set +e
+          scripts/security/npm-audit-report.sh reports/ci
+          audit_status=$?
+          set -e
+          if [ "$audit_status" -eq 20 ]; then
+            echo "npm audit technical failure"
+            exit 20
+          fi
+          if [ "$audit_status" -eq 10 ]; then
+            echo "npm audit found vulnerabilities; JSON reports are preserved for policy review"
+          fi
+          exit 0
+
+      - name: Upload npm audit reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-audit-reports
+          path: reports/ci/
+          if-no-files-found: error
+          retention-days: 14
+
+  container-security:
+    name: Container build and security
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: audit-dependencies
+    outputs:
+      security_decision: ${{ steps.policy.outputs.decision }}
+      high_count: ${{ steps.policy.outputs.high_count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download npm audit reports
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-audit-reports
+          path: reports/ci
+
+      - name: Build frontend image
+        run: docker build --tag taskflow/frontend:ci --file apps/frontend/Dockerfile .
+
+      - name: Build backend runtime image
+        run: docker build --tag taskflow/backend:ci --file apps/backend/Dockerfile .
+
+      - name: Build migrations image
+        run: docker build --target migrations --tag taskflow/migrate:ci --file apps/backend/Dockerfile .
+
+      - name: Verify runtime users and Prisma CLI isolation
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' taskflow/frontend:ci)" = node
+          test "$(docker image inspect --format '{{.Config.User}}' taskflow/backend:ci)" = node
+          docker run --rm --entrypoint sh taskflow/backend:ci -c 'test ! -e /app/node_modules/prisma && test ! -e /app/node_modules/@prisma/config && node -e "require(\"@prisma/client\")"'
+
+      - name: Scan images and generate SBOMs with pinned Trivy
+        env:
+          TRIVY_IMAGE: ${{ env.TRIVY_IMAGE }}
+          TRIVY_VERSION: ${{ env.TRIVY_VERSION }}
+        run: |
+          scripts/security/trivy-scan.sh taskflow/frontend:ci trivy-frontend reports/ci
+          scripts/security/trivy-scan.sh taskflow/backend:ci trivy-backend reports/ci
+          scripts/security/trivy-scan.sh taskflow/migrate:ci trivy-migrate reports/ci
+
+      - name: Verify required npm audit reports
+        run: |
+          test -s reports/ci/npm-audit-full.json
+          test -s reports/ci/npm-audit-production.json
+          test -s reports/ci/npm-audit-status.json
+
+      - name: Evaluate security policy
+        id: policy
+        run: |
+          set +e
+          scripts/security/evaluate-policy.sh reports/ci
+          policy_status=$?
+          set -e
+          if [ -f reports/ci/security-policy-summary.json ]; then
+            decision=$(node -p "require('./reports/ci/security-policy-summary.json').decision")
+            high_count=$(node -p "require('./reports/ci/security-policy-summary.json').highCount")
+            echo "decision=$decision" >> "$GITHUB_OUTPUT"
+            echo "high_count=$high_count" >> "$GITHUB_OUTPUT"
+            {
+              echo '### Container security disposition'
+              echo "- Decision: **$decision**"
+              echo "- HIGH findings: **$high_count**"
+              if [ "$decision" = 'PASS_WITH_REVIEW' ] && [ "$high_count" -gt 0 ]; then
+                echo '- **HUMAN APPROVAL REQUIRED**: HIGH findings remain pending human risk acceptance.'
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'decision=BLOCKED_TECHNICAL_FAILURE' >> "$GITHUB_OUTPUT"
+            echo 'high_count=0' >> "$GITHUB_OUTPUT"
+            echo '- **BLOCKED**: no security policy report was produced.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$policy_status"
+
+      - name: Upload container security reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: container-security-reports
+          path: reports/ci/
+          if-no-files-found: error
+          retention-days: 14
+
+  compose-validation:
+    name: Compose validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+  summary:
+    name: CI summary
+    if: ${{ always() }}
+    needs: [quality, audit-dependencies, container-security, compose-validation]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write execution summary
+        run: |
+          mkdir -p reports/ci
+          cat > reports/ci/ci-summary.md <<'EOF'
+          # CI execution summary
+
+          | Job | Result |
+          |---|---|
+          | quality | ${{ needs.quality.result }} |
+          | audit-dependencies | ${{ needs.audit-dependencies.result }} |
+          | container-security | ${{ needs.container-security.result }} |
+          | compose-validation | ${{ needs.compose-validation.result }} |
+          | security disposition | ${{ needs.container-security.outputs.security_decision }} |
+          | HIGH findings | ${{ needs.container-security.outputs.high_count }} |
+          EOF
+          if [ "${{ needs.container-security.outputs.security_decision }}" = 'PASS_WITH_REVIEW' ] && [ "${{ needs.container-security.outputs.high_count }}" -gt 0 ]; then
+            echo '**HUMAN APPROVAL REQUIRED**: HIGH findings remain pending human risk acceptance.' >> reports/ci/ci-summary.md
+          fi
+          if [ "${{ needs.quality.result }}" != success ] || \
+             [ "${{ needs.audit-dependencies.result }}" != success ] || \
+             [ "${{ needs.container-security.result }}" != success ] || \
+             [ "${{ needs.compose-validation.result }}" != success ]; then
+            echo 'At least one CI gate did not pass.'
+            exit 1
+          fi
+
+      - name: Upload execution summary
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-summary
+          path: reports/ci/ci-summary.md
+          if-no-files-found: error
+          retention-days: 14
